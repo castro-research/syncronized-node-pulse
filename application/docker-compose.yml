@@ -1,0 +1,13 @@
+services:
+  pulse:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000" # only cloudflared (same machine) reaches it; pulse.kurz.fyi points here
+    environment:
+      PUBLIC_URL: https://pulse.kurz.fyi # absolute URLs for the link previews (Open Graph)
+    volumes:
+      - pulse-data:/data # the rooms SQLite; survives container rebuilds
+
+volumes:
+  pulse-data:

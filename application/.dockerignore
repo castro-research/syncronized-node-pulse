@@ -1,0 +1,6 @@
+test
+tools
+lib
+server
+*.dwarf
+*.db
