@@ -1,4 +1,5 @@
 require "http/server"
+require "crypto/subtle"
 require "html"
 require "json"
 require "uuid"
@@ -26,6 +27,8 @@ STORE = DB.open("sqlite3://#{File.expand_path(ENV["DB_PATH"]? || "pulse.db")}")
 STORE.exec "create table if not exists rooms (id text primary key, owner text not null, bpm integer not null, t0 integer not null, touched integer not null)"
 # migration: databases created back when rooms had a name; fails (and is ignored) once the column is gone
 STORE.exec("alter table rooms drop column name") rescue nil
+# migration: rooms from before the manager key get an empty one, so nobody can change their BPM
+STORE.exec("alter table rooms add column key text not null default ''") rescue nil
 
 def now_ms : Int64
   Time.utc.to_unix_ms
@@ -46,29 +49,36 @@ class Room
   getter bpm : Int32 = 120
   getter t0 : Int64
   getter touched : Int64
+  getter key : String # secret handed only to whoever created the room: it is what makes them the manager
   @saved = 0_i64 # the value of touched that is on disk
   @members = {} of String => Int64
 
   def initialize(@id, @owner)
+    @key = Random::Secure.hex(16)
     @t0 = @touched = now_ms
     seen(@owner)
   end
 
   # A room read from disk: presence is not stored, it comes back by itself within seconds.
-  def initialize(@id, @owner, @bpm, @t0, @touched)
+  def initialize(@id, @owner, @bpm, @t0, @touched, @key)
     @saved = @touched
   end
 
   # Writes to disk. With force: false it only does so if the touched on disk is already old.
   def save(force = true)
     return unless force || @touched - @saved > SAVE_EVERY
-    STORE.exec "insert or replace into rooms values (?, ?, ?, ?, ?)", @id, @owner, @bpm, @t0, @touched
+    STORE.exec "insert or replace into rooms (id, owner, bpm, t0, touched, key) values (?, ?, ?, ?, ?, ?)", @id, @owner, @bpm, @t0, @touched, @key
     @saved = @touched
   end
 
   def set_bpm(bpm : Int32)
     @bpm = bpm
     @t0 = @touched = now_ms
+  end
+
+  # Only the manager may change the BPM. An empty key (old rooms) matches nobody.
+  def manager?(key : String?) : Bool
+    !@key.empty? && !key.nil? && Crypto::Subtle.constant_time_compare(@key, key)
   end
 
   def seen(who : String)
@@ -78,10 +88,12 @@ class Room
     @members[who] = t
   end
 
-  def write(io : IO)
+  # with_key: only in the response to the request that created the room.
+  def write(io : IO, with_key = false)
     JSON.build(io) do |j|
       j.object do
         j.field "id", @id
+        j.field "key", @key if with_key
         j.field "owner", @owner
         j.field "bpm", @bpm
         j.field "t0", @t0
@@ -98,8 +110,8 @@ class Api
 
   ROOMS = {} of String => Room
   STORE.exec "delete from rooms where touched < ?", now_ms - ROOM_TTL
-  STORE.query_each "select id, owner, bpm, t0, touched from rooms" do |rs|
-    room = Room.new(rs.read(String), rs.read(String), rs.read(Int32), rs.read(Int64), rs.read(Int64))
+  STORE.query_each "select id, owner, bpm, t0, touched, key from rooms" do |rs|
+    room = Room.new(rs.read(String), rs.read(String), rs.read(Int32), rs.read(Int64), rs.read(Int64), rs.read(String))
     ROOMS[room.id] = room
   end
 
@@ -177,7 +189,7 @@ class Api
     room = Room.new(UUID.random.to_s, clean(data["owner"]?.try(&.as_s?), "guest"))
     ROOMS[room.id] = room
     room.save
-    json(ctx, 201) { |io| room.write(io) }
+    json(ctx, 201) { |io| room.write(io, with_key: true) }
   end
 
   private def room(ctx, id : String)
@@ -189,6 +201,7 @@ class Api
       room.save(force: false)
     when "PUT"
       data = body(ctx) || return fail(ctx, 400, "invalid JSON")
+      return fail(ctx, 403, "only the room manager can change the BPM") unless room.manager?(data["key"]?.try(&.as_s?))
       bpm = data["bpm"]?.try(&.as_i?)
       return fail(ctx, 422, "bpm must be an integer between #{BPM_RANGE.begin} and #{BPM_RANGE.end}") unless bpm && BPM_RANGE.includes?(bpm)
       room.set_bpm(bpm)

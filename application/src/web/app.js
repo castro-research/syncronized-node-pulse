@@ -3,9 +3,11 @@
 import { clock } from "./clock.js";
 import { Metronome } from "./metronome.js";
 
+// localStorage, with a copy in memory for when the browser blocks it (private windows).
+const mem = new Map();
 const store = {
-  get: k => { try { return localStorage.getItem(k) } catch { return null } },
-  set: (k, v) => { try { localStorage.setItem(k, v) } catch {} },
+  get: k => { try { return localStorage.getItem(k) ?? mem.get(k) ?? null } catch { return mem.get(k) ?? null } },
+  set: (k, v) => { mem.set(k, v); try { localStorage.setItem(k, v) } catch {} },
 };
 
 async function api(path, body, method = body ? "POST" : "GET") {
@@ -108,7 +110,9 @@ customElements.define("pulse-home", class extends HTMLElement {
       const name = form.who.value.trim() || "guest";
       store.set("pulse:name", name);
       try {
-        go(`/room/${(await api("/api/rooms", { owner: name })).id}`);
+        const room = await api("/api/rooms", { owner: name });
+        store.set(`pulse:key:${room.id}`, room.key); // this browser is the room's manager
+        go(`/room/${room.id}`);
       } catch {
         err.textContent = "Could not create the room. Please try again.";
         err.hidden = false;
@@ -188,9 +192,10 @@ customElements.define("pulse-room", class extends HTMLElement {
           <button type="button" class="step" data-step="1" aria-label="Increase by 1 BPM">+</button>
         </div>
         <input type="range" min="30" max="240" step="1" data-bpm aria-label="Room BPM">
+        <p class="muted" data-locked hidden></p>
         <button type="button" class="play" data-toggle aria-label="Start" aria-keyshortcuts="Space" title="Start (Space)">${ICON.play}${ICON.pause}</button>
         <p class="muted who" data-members></p>
-        <p class="hints muted"><kbd>Space</kbd> start or stop · <kbd>←</kbd> <kbd>→</kbd> BPM ±1 · <kbd>Shift</kbd> ±10</p>
+        <p class="hints muted"><kbd>Space</kbd> start or stop<span data-hints> · <kbd>←</kbd> <kbd>→</kbd> BPM ±1 · <kbd>Shift</kbd> ±10</span></p>
       </div>
       <aside class="panel" aria-label="Room details">
         <section>
@@ -234,16 +239,23 @@ customElements.define("pulse-room", class extends HTMLElement {
 
     // BPM: the slider and the − and + buttons change the value; a moment later it goes to the server
     // and everyone in the room hears it. Until that request finishes, polling does not undo it.
+    // Only the manager (whoever created the room, in this browser) can change it; the server enforces it.
+    const key = store.get(`pulse:key:${this.#id}`);
+    bpm.disabled = !key;
+    for (const b of this.querySelectorAll("[data-step]")) b.disabled = !key;
+    $("[data-locked]").hidden = !!key;
+    $("[data-locked]").textContent = `Only ${room.owner} can change the BPM.`;
+    $("[data-hints]").hidden = !key;
     let sending = 0;
     const show = () => { out.textContent = bpm.value; bpm.style.setProperty("--p", `${(bpm.value - 30) / 2.1}%`) };
     const send = () => {
       clearTimeout(sending);
-      sending = setTimeout(() => api(`/api/rooms/${this.#id}`, { bpm: +bpm.value, who: this.#who }, "PUT")
+      sending = setTimeout(() => api(`/api/rooms/${this.#id}`, { bpm: +bpm.value, who: this.#who, key }, "PUT")
         .then(r => this.#apply(r)).catch(() => {}).finally(() => { sending = 0 }), 250);
     };
     bpm.oninput = show;
     bpm.onchange = send;
-    const nudge = d => { bpm.value = Math.min(240, Math.max(30, +bpm.value + d)); show(); send() };
+    const nudge = d => { if (!key) return; bpm.value = Math.min(240, Math.max(30, +bpm.value + d)); show(); send() };
     for (const b of this.querySelectorAll("[data-step]")) b.onclick = () => nudge(+b.dataset.step);
 
     toggle.onclick = async () => {
@@ -270,7 +282,7 @@ customElements.define("pulse-room", class extends HTMLElement {
       if (this.#state && r.t0 < this.#state.t0) return; // late response from an older poll
       if (!this.#state || r.t0 !== this.#state.t0 || r.bpm !== this.#state.bpm) this.#metro.set({ t0: r.t0, bpm: r.bpm });
       this.#state = r;
-      if (!sending && document.activeElement !== bpm) { bpm.value = r.bpm; show() }
+      if (!sending && (!key || document.activeElement !== bpm)) { bpm.value = r.bpm; show() }
       $("[data-members]").textContent = `In the room: ${r.members.join(", ")}`;
       $("[data-list]").replaceChildren(...r.members.map(name => {
         const li = document.createElement("li"), avatar = document.createElement("span"), label = document.createElement("span");

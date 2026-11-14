@@ -26,6 +26,7 @@ const created = await call("/api/rooms", "POST", { owner: "  Ana  " });
 assert.equal(created.status, 201);
 const room = created.json;
 assert.match(room.id, UUID);
+assert.match(room.key, /^[0-9a-f]{32}$/); // the manager key, handed out only here
 assert.equal(room.owner, "Ana"); // trimmed
 assert.equal(room.name, undefined); // rooms have no name
 assert.equal(room.bpm, 120);
@@ -44,10 +45,17 @@ assert.equal((await call("/api/rooms", "POST", { owner: "y".repeat(5000) })).sta
 const seen = await call(`/api/rooms/${room.id}?who=${encodeURIComponent("Bia")}`);
 assert.equal(seen.status, 200);
 assert.deepEqual(seen.json.members.sort(), ["Ana", "Bia"]);
+assert.equal(seen.json.key, undefined, "polling must not leak the manager key");
 
 // change the BPM: new t0 (the instant of the change) and the same BPM for whoever polls later
 await new Promise(r => setTimeout(r, 5));
-const put = await call(`/api/rooms/${room.id}`, "PUT", { bpm: 90, who: "Bia" });
+// only the manager can change the BPM: no key, a wrong key or another room's key are all refused
+const other = (await call("/api/rooms", "POST", { owner: "Ana" })).json; // same name, different room
+for (const key of [undefined, "", "0".repeat(32), other.key, 123])
+  assert.equal((await call(`/api/rooms/${room.id}`, "PUT", { bpm: 90, who: "Ana", key })).status, 403, `key ${key} should be refused`);
+assert.equal((await call(`/api/rooms/${room.id}`)).json.bpm, 120);
+const put = await call(`/api/rooms/${room.id}`, "PUT", { bpm: 90, who: "Ana", key: room.key });
+assert.equal(put.json.key, undefined);
 assert.equal(put.status, 200);
 assert.equal(put.json.bpm, 90);
 assert.ok(put.json.t0 > room.t0, "t0 must move forward with the new BPM");
@@ -55,10 +63,10 @@ assert.equal((await call(`/api/rooms/${room.id}`)).json.bpm, 90);
 
 // invalid BPM
 for (const bpm of [29, 241, 120.5, "abc", null, -1]) {
-  const bad = await call(`/api/rooms/${room.id}`, "PUT", { bpm });
+  const bad = await call(`/api/rooms/${room.id}`, "PUT", { bpm, key: room.key });
   assert.equal(bad.status, 422, `bpm ${JSON.stringify(bpm)} should be rejected`);
 }
-assert.equal((await call(`/api/rooms/${room.id}`, "PUT", {})).status, 422);
+assert.equal((await call(`/api/rooms/${room.id}`, "PUT", { key: room.key })).status, 422);
 assert.equal((await call(`/api/rooms/${room.id}`, "PUT", "xx")).status, 400);
 assert.equal((await call(`/api/rooms/${room.id}`, "DELETE")).status, 405);
 assert.equal((await call(`/api/rooms/${room.id}`)).json.bpm, 90); // none of this changed the room
